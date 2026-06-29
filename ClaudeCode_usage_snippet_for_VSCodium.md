@@ -17,7 +17,7 @@ The numbers are the **real** values from Anthropic's usage endpoint — the same
 Two adjacent items appear at the right side of the VSCodium status bar:
 
 ```
-…  $(pulse) S 79% ▰▰▰▰▰▰▱   $(calendar) W 70% ▰▰▰▰▰▱▱
+…  $(pulse) S 79% ▰▰▰▰▰▰▱  ⏳⣿⣧⠀   $(calendar) W 70% ▰▰▰▰▰▱▱  ⏳⣷⠀⠀
 ```
 
 | Item | Icon | Meaning |
@@ -27,8 +27,35 @@ Two adjacent items appear at the right side of the VSCodium status bar:
 
 - Each item is colored **independently** by its own percentage (a single status‑bar item can only
   carry one color, so we use two items).
+- A **"resets in" sand‑timer gauge** follows each usage bar (see §2a).
 - Hover shows a **tooltip** with the exact percentage and **time until reset** (`resets_at`).
 - Click either item to **refresh immediately** (it also auto‑refreshes every 60s).
+
+---
+
+## 2a. "Resets in" sand‑timer gauge
+
+A **second** dimension — how much **time is left** in the window before it resets — rendered as a
+**sand‑timer** that empties as the reset approaches. This is independent of the usage % bar.
+
+```
+  full window    ⏳⣿⣿⣿      ← just reset, sand full
+  half left      ⏳⣿⡇⠀
+  almost out     ⌛⡀⠀⠀      ← hourglass flips to ⌛ near empty
+```
+
+- **Glyph:** `⏳` while sand is running, flipping to `⌛` when the window is nearly empty.
+- **Drain:** a short braille bar (`⣿⣧⠀` …) that empties left‑to‑right at sub‑cell resolution
+  (`⠀⡀⡄⡆⡇⣇⣧⣷⣿`), giving smooth motion across the whole window. The exact `resets_at` countdown is
+  intentionally **not** shown as text — the draining sand carries it (hover for the colored gauge).
+- **Window length** is a known constant (Session 5h, Weekly 7d; both configurable) — the API returns
+  `resets_at` but not the window start, so `fracLeft = clamp((resets_at − now) / windowMs, 0, 1)`.
+- **Inline color note:** a status‑bar item carries only **one** foreground color, already owned by
+  the usage %, and emoji glyphs render in their own font color. So inline, urgency is conveyed by the
+  **glyph + how much sand is left**, not by recoloring. The **colored** inverted gauge (green when
+  lots of time remains → red as the reset nears) lives in the **hover tooltip** via HTML spans.
+- Toggle with `claudeUsage.showResetGauge`; tune urgency colors with
+  `claudeUsage.timeWarnPct`/`timeHighPct`/`timeCritPct` (percent of window **elapsed**).
 
 ---
 
@@ -105,10 +132,14 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
 
 1. Read `accessToken` + `expiresAt` from `~/.claude/.credentials.json`.
 2. `GET /api/oauth/usage`; on `200`, parse `five_hour` / `seven_day`.
-3. `pct = round(utilization)`, render `$(icon) <S|W> <pct>% <bar>` with the color from §3 and a
-   tooltip showing the % and `resets_at` countdown.
+3. `pct = round(utilization)`, render `$(icon) <S|W> <pct>% <bar>` with the color from §3, followed
+   by the sand-timer reset gauge (§2a, no text), and a tooltip showing the % and the colored
+   time-left drain.
 4. Repeat every `refreshIntervalSeconds` (default 60, min 15) and on demand via `claudeUsage.refresh`.
-5. On `401` / network / timeout / parse errors, show a muted `—` state with an explanatory tooltip.
+5. On `401` / parse errors, show a muted `—` state with an explanatory tooltip. **Transient** errors
+   (HTTP 429, 5xx, network, timeout) are **swallowed once data exists** — the last good values stay
+   on screen instead of flashing an error. On HTTP 429 the extension **backs off** (honoring the
+   `Retry-After` header, else 5 min) and skips polling until the backoff expires.
 
 ---
 
@@ -119,7 +150,7 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
   "name": "claude-usage-statusbar",
   "displayName": "Claude Code Usage (status bar)",
   "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "publisher": "local",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -139,8 +170,8 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
         },
         "claudeUsage.refreshIntervalSeconds": {
           "type": "number",
-          "default": 60,
-          "description": "How often to poll the usage endpoint (seconds; min 15)."
+          "default": 120,
+          "description": "How often to poll the usage endpoint (seconds; min 15). The extension also backs off automatically when rate-limited (HTTP 429)."
         },
         "claudeUsage.barSegments": {
           "type": "number",
@@ -166,6 +197,36 @@ running to refresh it, the items show `—` with a tooltip prompting you to open
           "type": "string",
           "default": "oauth-2025-04-20",
           "description": "Value of the anthropic-beta header required by the OAuth usage endpoint."
+        },
+        "claudeUsage.showResetGauge": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the 'resets in' sand-timer gauge (hourglass + draining braille cells + countdown) next to each usage bar."
+        },
+        "claudeUsage.sessionWindowHours": {
+          "type": "number",
+          "default": 5,
+          "description": "Length of the Session window in hours (used to compute how much time is left for the reset gauge)."
+        },
+        "claudeUsage.weeklyWindowDays": {
+          "type": "number",
+          "default": 7,
+          "description": "Length of the Weekly window in days (used to compute how much time is left for the reset gauge)."
+        },
+        "claudeUsage.timeWarnPct": {
+          "type": "number",
+          "default": 50,
+          "description": "Percent of the window elapsed at which the tooltip reset gauge turns yellow."
+        },
+        "claudeUsage.timeHighPct": {
+          "type": "number",
+          "default": 75,
+          "description": "Percent of the window elapsed at which the tooltip reset gauge turns orange."
+        },
+        "claudeUsage.timeCritPct": {
+          "type": "number",
+          "default": 90,
+          "description": "Percent of the window elapsed at which the tooltip reset gauge turns red."
         }
       }
     }
@@ -192,18 +253,26 @@ const os = require('os');
 const https = require('https');
 
 let sessionItem, weeklyItem, timer;
+let hasData = false;     // have we ever rendered real values?
+let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshSeconds: c.get('refreshIntervalSeconds', 60),
+    refreshSeconds: c.get('refreshIntervalSeconds', 120),
     segments: c.get('barSegments', 7),
     warn: c.get('warnThreshold', 60),
     high: c.get('highThreshold', 80),
     critical: c.get('criticalThreshold', 95),
     betaHeader: c.get('betaHeader', 'oauth-2025-04-20'),
+    showResetGauge: c.get('showResetGauge', true),
+    sessionWindowHours: c.get('sessionWindowHours', 5),
+    weeklyWindowDays: c.get('weeklyWindowDays', 7),
+    timeWarn: c.get('timeWarnPct', 50),
+    timeHigh: c.get('timeHighPct', 75),
+    timeCrit: c.get('timeCritPct', 90),
   };
 }
 
@@ -235,6 +304,10 @@ function fetchUsage(cfg) {
       res.on('data', (c) => (body += c));
       res.on('end', () => {
         if (res.statusCode === 401) return resolve({ error: 'auth' });
+        if (res.statusCode === 429) {
+          const ra = parseInt(res.headers['retry-after'], 10);
+          return resolve({ error: 'http-429', retryAfter: Number.isFinite(ra) ? ra : null });
+        }
         if (res.statusCode !== 200) return resolve({ error: 'http-' + res.statusCode });
         try { resolve({ data: JSON.parse(body) }); } catch { resolve({ error: 'parse' }); }
       });
@@ -267,6 +340,41 @@ function colorFor(pct, cfg) {
   return { color: 'charts.green', bg: null };
 }
 
+// Fraction of the window still remaining (1 = just reset, 0 = at reset), or null.
+function fracLeft(iso, windowMs) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t) || !(windowMs > 0)) return null;
+  return Math.max(0, Math.min(1, (t - Date.now()) / windowMs));
+}
+
+// Hourglass: sand running (⏳) until nearly empty, then flipped/run-out (⌛).
+function sandGlyph(frac) {
+  return frac > 0.06 ? '⏳' : '⌛';
+}
+
+// Short braille "sand drain": leftmost cells stay full, draining toward empty.
+const SAND = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿']; // empty → full (9 levels)
+function sandBar(frac, cells) {
+  const total = cells * (SAND.length - 1);
+  let units = Math.round(frac * total);
+  let out = '';
+  for (let i = 0; i < cells; i++) {
+    const lvl = Math.max(0, Math.min(SAND.length - 1, units));
+    out += SAND[lvl];
+    units -= SAND.length - 1;
+  }
+  return out;
+}
+
+// Inverted urgency by time left → hex (green when full, red as reset nears).
+function timeColorHex(frac, cfg) {
+  const elapsed = (1 - frac) * 100;
+  if (elapsed >= cfg.timeCrit) return '#F14C4C';
+  if (elapsed >= cfg.timeHigh) return '#D7894E';
+  if (elapsed >= cfg.timeWarn) return '#E2C08D';
+  return '#89D185';
+}
+
 function resetsIn(iso) {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return null;
@@ -277,7 +385,7 @@ function resetsIn(iso) {
   return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function renderItem(item, icon, label, name, pct, reset, cfg) {
+function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
   if (pct == null) {
     item.text = `$(${icon}) ${label} —`;
     item.color = new vscode.ThemeColor('descriptionForeground');
@@ -288,14 +396,24 @@ function renderItem(item, icon, label, name, pct, reset, cfg) {
   }
   const p = Math.round(pct);
   const { color, bg } = colorFor(p, cfg);
-  item.text = `$(${icon}) ${label} ${p}% ${bar(p, cfg.segments)}`;
+  const r = resetsIn(reset);
+  const f = fracLeft(reset, windowMs);
+  // Inline: usage bar, then the sand-timer gauge (glyph + drain), no countdown text.
+  let text = `$(${icon}) ${label} ${p}% ${bar(p, cfg.segments)}`;
+  if (cfg.showResetGauge && f != null) {
+    text += `  ${sandGlyph(f)}${sandBar(f, 3)}`;
+  }
+  item.text = text;
   item.color = new vscode.ThemeColor(color);
   item.backgroundColor = bg ? new vscode.ThemeColor(bg) : undefined;
   const md = new vscode.MarkdownString(undefined, true);
+  md.supportHtml = true;
   md.appendMarkdown(`**Claude Code — ${name} usage**\n\n`);
-  md.appendMarkdown(`- Used: **${p}%**\n`);
-  const r = resetsIn(reset);
-  if (r) md.appendMarkdown(`- Resets in: **${r}**\n`);
+  md.appendMarkdown(`- Used: **${p}%** ${bar(p, cfg.segments)}\n`);
+  if (f != null) {
+    const drain = `<span style="color:${timeColorHex(f, cfg)};">${sandBar(f, cfg.segments)}</span>`;
+    md.appendMarkdown(`- Resets in: ${sandGlyph(f)} ${drain}\n`);
+  }
   md.appendMarkdown('\n_Live from api.anthropic.com/api/oauth/usage. Click to refresh._');
   item.tooltip = md;
   item.show();
@@ -308,6 +426,7 @@ function showError(kind) {
     'network': 'No network connection.',
     'timeout': 'Usage request timed out.',
     'parse': 'Unexpected response from the usage API.',
+    'http-429': 'Rate-limited by the usage API — backing off.',
   }[kind] || ('Usage error: ' + kind);
   for (const [it, ic, lb] of [[sessionItem, 'pulse', 'S'], [weeklyItem, 'calendar', 'W']]) {
     it.text = `$(${ic}) ${lb} —`;
@@ -319,13 +438,27 @@ function showError(kind) {
 }
 
 async function refresh() {
+  if (Date.now() < backoffUntil) return; // still backing off from a 429
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
-  if (r.error) return showError(r.error);
+  if (r.error) {
+    if (r.error === 'http-429') {
+      backoffUntil = Date.now() + (r.retryAfter || 300) * 1000;
+    }
+    // Swallow transient errors once we have data — keep the last good values visible.
+    const transient = r.error === 'http-429' || r.error === 'network' ||
+      r.error === 'timeout' || /^http-5/.test(r.error);
+    if (transient && hasData) return;
+    return showError(r.error);
+  }
+  hasData = true;
+  backoffUntil = 0;
   const s = pick(r.data, 'five_hour', 'session');
   const w = pick(r.data, 'seven_day', 'weekly');
-  renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg);
-  renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg);
+  const sessionMs = cfg.sessionWindowHours * 3600e3;
+  const weeklyMs = cfg.weeklyWindowDays * 86400e3;
+  renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg, sessionMs);
+  renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg, weeklyMs);
 }
 
 function startTimer() {

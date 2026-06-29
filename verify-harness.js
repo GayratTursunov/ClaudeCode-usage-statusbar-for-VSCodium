@@ -14,6 +14,47 @@ function bar(p, n = 7) {
   return '▰'.repeat(f) + '▱'.repeat(n - f);
 }
 
+// Mirror the extension's reset-gauge helpers so we can preview them here.
+function fracLeft(iso, windowMs) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t) || !(windowMs > 0)) return null;
+  return Math.max(0, Math.min(1, (t - Date.now()) / windowMs));
+}
+function sandGlyph(frac) { return frac > 0.06 ? '⏳' : '⌛'; }
+const SAND = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿'];
+function sandBar(frac, cells) {
+  let units = Math.round(frac * cells * (SAND.length - 1)), out = '';
+  for (let i = 0; i < cells; i++) {
+    out += SAND[Math.max(0, Math.min(SAND.length - 1, units))];
+    units -= SAND.length - 1;
+  }
+  return out;
+}
+function resetsIn(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  let s = Math.max(0, Math.round((t - Date.now()) / 1000));
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+function gauge(reset, windowMs) {
+  const f = fracLeft(reset, windowMs);
+  return f != null ? `  ${sandGlyph(f)}${sandBar(f, 3)}` : '';
+}
+
+// Offline self-check of the sand-timer gauge across the window (incl. null reset).
+(function selfCheck() {
+  const W = 5 * 3600e3, now = Date.now();
+  console.log('--- reset gauge preview (Session, 5h window) ---');
+  for (const frac of [1, 0.75, 0.5, 0.25, 0.05, 0]) {
+    const iso = new Date(now + frac * W).toISOString();
+    console.log(`  frac=${frac.toFixed(2)}  ⏳→ ${sandGlyph(frac)}${sandBar(frac, 3)}  ${resetsIn(iso)}`);
+  }
+  console.log(`  null reset → "${gauge(null, W)}" (gauge omitted)\n`);
+})();
+
 const req = https.request({
   hostname: 'api.anthropic.com', path: '/api/oauth/usage', method: 'GET',
   headers: {
@@ -30,8 +71,8 @@ const req = https.request({
     const d = JSON.parse(b);
     const s = d.five_hour || {}, w = d.seven_day || {};
     const sp = Math.round(s.utilization), wp = Math.round(w.utilization);
-    console.log(`Session: $(pulse) S ${sp}% ${bar(sp)}   resets ${s.resets_at}`);
-    console.log(`Weekly : $(calendar) W ${wp}% ${bar(wp)}   resets ${w.resets_at}`);
+    console.log(`Session: $(pulse) S ${sp}% ${bar(sp)}${gauge(s.resets_at, 5 * 3600e3)}`);
+    console.log(`Weekly : $(calendar) W ${wp}% ${bar(wp)}${gauge(w.resets_at, 7 * 86400e3)}`);
   });
 });
 req.on('error', (e) => console.error('network error:', e.message));

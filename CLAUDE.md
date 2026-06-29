@@ -33,7 +33,9 @@ Guidance for Claude Code working in `/home/irek/Documents/VSCodium/`.
 - **The installed copy is separate.** The live extension lives at
   `~/.vscode-oss/extensions/claude-usage-statusbar/`. After editing the source here, re-copy and reload:
   ```bash
-  cp -r claude-usage-statusbar ~/.vscode-oss/extensions/
+  # Exclude .git — its pack objects are read-only and break a plain cp -r.
+  rsync -a --exclude .git claude-usage-statusbar ~/.vscode-oss/extensions/
+  # (or copy just the runtime files: cp extension.js package.json verify-harness.js README.md ~/.vscode-oss/extensions/claude-usage-statusbar/)
   # then in VSCodium: Developer: Reload Window
   ```
 

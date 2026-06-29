@@ -9,18 +9,26 @@ const os = require('os');
 const https = require('https');
 
 let sessionItem, weeklyItem, timer;
+let hasData = false;     // have we ever rendered real values?
+let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshSeconds: c.get('refreshIntervalSeconds', 60),
+    refreshSeconds: c.get('refreshIntervalSeconds', 120),
     segments: c.get('barSegments', 7),
     warn: c.get('warnThreshold', 60),
     high: c.get('highThreshold', 80),
     critical: c.get('criticalThreshold', 95),
     betaHeader: c.get('betaHeader', 'oauth-2025-04-20'),
+    showResetGauge: c.get('showResetGauge', true),
+    sessionWindowHours: c.get('sessionWindowHours', 5),
+    weeklyWindowDays: c.get('weeklyWindowDays', 7),
+    timeWarn: c.get('timeWarnPct', 50),
+    timeHigh: c.get('timeHighPct', 75),
+    timeCrit: c.get('timeCritPct', 90),
   };
 }
 
@@ -52,6 +60,10 @@ function fetchUsage(cfg) {
       res.on('data', (c) => (body += c));
       res.on('end', () => {
         if (res.statusCode === 401) return resolve({ error: 'auth' });
+        if (res.statusCode === 429) {
+          const ra = parseInt(res.headers['retry-after'], 10);
+          return resolve({ error: 'http-429', retryAfter: Number.isFinite(ra) ? ra : null });
+        }
         if (res.statusCode !== 200) return resolve({ error: 'http-' + res.statusCode });
         try { resolve({ data: JSON.parse(body) }); } catch { resolve({ error: 'parse' }); }
       });
@@ -84,6 +96,41 @@ function colorFor(pct, cfg) {
   return { color: 'charts.green', bg: null };
 }
 
+// Fraction of the window still remaining (1 = just reset, 0 = at reset), or null.
+function fracLeft(iso, windowMs) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t) || !(windowMs > 0)) return null;
+  return Math.max(0, Math.min(1, (t - Date.now()) / windowMs));
+}
+
+// Hourglass: sand running (⏳) until nearly empty, then flipped/run-out (⌛).
+function sandGlyph(frac) {
+  return frac > 0.06 ? '⏳' : '⌛';
+}
+
+// Short braille "sand drain": leftmost cells stay full, draining toward empty.
+const SAND = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿']; // empty → full (9 levels)
+function sandBar(frac, cells) {
+  const total = cells * (SAND.length - 1);
+  let units = Math.round(frac * total);
+  let out = '';
+  for (let i = 0; i < cells; i++) {
+    const lvl = Math.max(0, Math.min(SAND.length - 1, units));
+    out += SAND[lvl];
+    units -= SAND.length - 1;
+  }
+  return out;
+}
+
+// Inverted urgency by time left → hex (green when full, red as reset nears).
+function timeColorHex(frac, cfg) {
+  const elapsed = (1 - frac) * 100;
+  if (elapsed >= cfg.timeCrit) return '#F14C4C';
+  if (elapsed >= cfg.timeHigh) return '#D7894E';
+  if (elapsed >= cfg.timeWarn) return '#E2C08D';
+  return '#89D185';
+}
+
 function resetsIn(iso) {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return null;
@@ -94,7 +141,7 @@ function resetsIn(iso) {
   return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function renderItem(item, icon, label, name, pct, reset, cfg) {
+function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
   if (pct == null) {
     item.text = `$(${icon}) ${label} —`;
     item.color = new vscode.ThemeColor('descriptionForeground');
@@ -105,14 +152,24 @@ function renderItem(item, icon, label, name, pct, reset, cfg) {
   }
   const p = Math.round(pct);
   const { color, bg } = colorFor(p, cfg);
-  item.text = `$(${icon}) ${label} ${p}% ${bar(p, cfg.segments)}`;
+  const r = resetsIn(reset);
+  const f = fracLeft(reset, windowMs);
+  // Inline: usage bar, then the sand-timer gauge (glyph + drain), no countdown text.
+  let text = `$(${icon}) ${label} ${p}% ${bar(p, cfg.segments)}`;
+  if (cfg.showResetGauge && f != null) {
+    text += `  ${sandGlyph(f)}${sandBar(f, 3)}`;
+  }
+  item.text = text;
   item.color = new vscode.ThemeColor(color);
   item.backgroundColor = bg ? new vscode.ThemeColor(bg) : undefined;
   const md = new vscode.MarkdownString(undefined, true);
+  md.supportHtml = true;
   md.appendMarkdown(`**Claude Code — ${name} usage**\n\n`);
-  md.appendMarkdown(`- Used: **${p}%**\n`);
-  const r = resetsIn(reset);
-  if (r) md.appendMarkdown(`- Resets in: **${r}**\n`);
+  md.appendMarkdown(`- Used: **${p}%** ${bar(p, cfg.segments)}\n`);
+  if (f != null) {
+    const drain = `<span style="color:${timeColorHex(f, cfg)};">${sandBar(f, cfg.segments)}</span>`;
+    md.appendMarkdown(`- Resets in: ${sandGlyph(f)} ${drain}\n`);
+  }
   md.appendMarkdown('\n_Live from api.anthropic.com/api/oauth/usage. Click to refresh._');
   item.tooltip = md;
   item.show();
@@ -125,6 +182,7 @@ function showError(kind) {
     'network': 'No network connection.',
     'timeout': 'Usage request timed out.',
     'parse': 'Unexpected response from the usage API.',
+    'http-429': 'Rate-limited by the usage API — backing off.',
   }[kind] || ('Usage error: ' + kind);
   for (const [it, ic, lb] of [[sessionItem, 'pulse', 'S'], [weeklyItem, 'calendar', 'W']]) {
     it.text = `$(${ic}) ${lb} —`;
@@ -136,13 +194,27 @@ function showError(kind) {
 }
 
 async function refresh() {
+  if (Date.now() < backoffUntil) return; // still backing off from a 429
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
-  if (r.error) return showError(r.error);
+  if (r.error) {
+    if (r.error === 'http-429') {
+      backoffUntil = Date.now() + (r.retryAfter || 300) * 1000;
+    }
+    // Swallow transient errors once we have data — keep the last good values visible.
+    const transient = r.error === 'http-429' || r.error === 'network' ||
+      r.error === 'timeout' || /^http-5/.test(r.error);
+    if (transient && hasData) return;
+    return showError(r.error);
+  }
+  hasData = true;
+  backoffUntil = 0;
   const s = pick(r.data, 'five_hour', 'session');
   const w = pick(r.data, 'seven_day', 'weekly');
-  renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg);
-  renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg);
+  const sessionMs = cfg.sessionWindowHours * 3600e3;
+  const weeklyMs = cfg.weeklyWindowDays * 86400e3;
+  renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg, sessionMs);
+  renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg, weeklyMs);
 }
 
 function startTimer() {
