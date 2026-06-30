@@ -2,7 +2,7 @@
   "name": "claude-usage-statusbar",
   "displayName": "Claude Code Usage (status bar)",
   "description": "Shows live Session and Weekly Claude Code usage % (from Anthropic's usage API) with colored progress bars.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "local",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
@@ -20,10 +20,30 @@
           "default": "~/.claude/.credentials.json",
           "description": "Path to the Claude Code OAuth credentials file (read locally; the token is sent only to api.anthropic.com)."
         },
-        "claudeUsage.refreshIntervalSeconds": {
+        "claudeUsage.refreshBaseSeconds": {
+          "type": "number",
+          "default": 90,
+          "description": "Base idle poll interval (seconds; min 15). Each poll is jittered by ±refreshJitterPct so clients de-synchronize. With syncToActivity on, refreshes are mainly driven by request activity; this timer just catches resets/idle."
+        },
+        "claudeUsage.refreshJitterPct": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Random jitter applied to refreshBaseSeconds as a ± fraction (0.2 = ±20%, so a 90s base polls every ~72–108s)."
+        },
+        "claudeUsage.backoffBaseSeconds": {
+          "type": "number",
+          "default": 2,
+          "description": "Base for full-jitter exponential backoff after a failed usage call. Wait = random(0, min(backoffCapSeconds, base·2^(n-1))) for the n-th consecutive failure."
+        },
+        "claudeUsage.backoffCapSeconds": {
           "type": "number",
           "default": 300,
-          "description": "Idle safety-net poll interval (seconds; min 15). With syncToActivity on, refreshes are mainly driven by request activity; this timer just catches resets/idle. The extension also backs off automatically when rate-limited (HTTP 429)."
+          "description": "Maximum backoff window (seconds) after repeated failures. A 429 response's Retry-After is always honored as a floor."
+        },
+        "claudeUsage.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 90,
+          "description": "Deprecated: alias for refreshBaseSeconds (used only if refreshBaseSeconds is unset)."
         },
         "claudeUsage.barSegments": {
           "type": "number",

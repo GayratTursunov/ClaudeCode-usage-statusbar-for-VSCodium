@@ -9,8 +9,9 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 
-let sessionItem, weeklyItem, timer;
+let sessionItem, weeklyItem, pollTimer;
 let hasData = false;     // have we ever rendered real values?
+let backoffAttempt = 0;  // consecutive-failure count for full-jitter backoff
 let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
 let activityTimer;       // local poll of Claude Code logs
 let debounceTimer;       // settle timer before an activity-triggered refresh
@@ -26,7 +27,10 @@ function getCfg() {
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshSeconds: c.get('refreshIntervalSeconds', 300),
+    refreshBaseSeconds: c.get('refreshBaseSeconds', c.get('refreshIntervalSeconds', 90)),
+    refreshJitterPct: c.get('refreshJitterPct', 0.2),
+    backoffBaseSeconds: c.get('backoffBaseSeconds', 2),
+    backoffCapSeconds: c.get('backoffCapSeconds', 300),
     syncToActivity: c.get('syncToActivity', true),
     activityPollSeconds: c.get('activityPollSeconds', 5),
     activityDebounceSeconds: c.get('activityDebounceSeconds', 4),
@@ -257,14 +261,17 @@ function stopStale() {
 }
 
 async function refresh() {
-  if (Date.now() < backoffUntil) return; // still backing off from a 429
+  if (Date.now() < backoffUntil) return; // still inside an active backoff window
   lastApiAttempt = Date.now();
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
   if (r.error) {
-    if (r.error === 'http-429') {
-      backoffUntil = Date.now() + (r.retryAfter || 300) * 1000;
-    }
+    // Full-jitter exponential backoff after ANY failure; 429 Retry-After is a floor.
+    backoffAttempt++;
+    const retryAfter = r.error === 'http-429' ? (r.retryAfter || 0) : 0;
+    const delay = backoffDelayMs(cfg, backoffAttempt, retryAfter);
+    backoffUntil = Date.now() + delay;
+    scheduleNextPoll(delay);
     // Swallow transient errors once we have data — keep the last good values visible.
     const transient = r.error === 'http-429' || r.error === 'network' ||
       r.error === 'timeout' || /^http-5/.test(r.error);
@@ -272,8 +279,10 @@ async function refresh() {
     return showError(r.error);
   }
   hasData = true;
+  backoffAttempt = 0;
   backoffUntil = 0;
   stopStale();
+  scheduleNextPoll(nextPollDelayMs(cfg));
   const s = pick(r.data, 'five_hour', 'session');
   const w = pick(r.data, 'seven_day', 'weekly');
   const sessionMs = cfg.sessionWindowHours * 3600e3;
@@ -287,9 +296,23 @@ async function refresh() {
   renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg, weeklyMs);
 }
 
-function startTimer() {
-  if (timer) clearInterval(timer);
-  timer = setInterval(refresh, Math.max(15, getCfg().refreshSeconds) * 1000);
+// Idle poll delay: base ±jitterPct (floored at 15s), so clients de-synchronize.
+function nextPollDelayMs(cfg) {
+  const base = Math.max(15, cfg.refreshBaseSeconds);
+  const j = 1 + (Math.random() * 2 - 1) * cfg.refreshJitterPct; // 1 ± pct
+  return base * j * 1000;
+}
+
+// AWS "full jitter": rand(0, min(cap, base*2^(attempt-1))); 429 floors at retryAfter.
+function backoffDelayMs(cfg, attempt, retryAfterSec) {
+  const ceil = Math.min(cfg.backoffCapSeconds, cfg.backoffBaseSeconds * 2 ** (attempt - 1));
+  const jittered = Math.random() * ceil;
+  return Math.max(retryAfterSec || 0, jittered) * 1000;
+}
+
+function scheduleNextPoll(ms) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(refresh, ms);
 }
 
 // ~/.claude/projects — where Claude Code appends per-request session logs.
@@ -348,17 +371,16 @@ function activate(context) {
     vscode.commands.registerCommand('claudeUsage.refresh', refresh),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claudeUsage')) {
-        startTimer(); startActivityWatch(getCfg()); refresh();
+        startActivityWatch(getCfg()); refresh();
       }
     })
   );
-  refresh();
-  startTimer();
+  refresh(); // self-schedules the next poll based on its outcome
   startActivityWatch(getCfg());
 }
 
 function deactivate() {
-  if (timer) clearInterval(timer);
+  if (pollTimer) clearTimeout(pollTimer);
   if (activityTimer) clearInterval(activityTimer);
   if (debounceTimer) clearTimeout(debounceTimer);
   if (staleTimer) clearInterval(staleTimer);
