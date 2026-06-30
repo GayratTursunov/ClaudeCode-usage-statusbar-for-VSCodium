@@ -216,8 +216,11 @@ function renderStale() {
   const since = Math.max(0, Math.round((Date.now() - lastGoodAt) / 1000));
   const ago = since >= 60 ? `${Math.floor(since / 60)}m ${since % 60}s` : `${since}s`;
   for (const v of lastValues) {
-    const { item, icon, label, name, pct, reset, windowMs, cfg } = v;
-    let text = `$(${icon}) ${spin} ${label}`;
+    const { item, label, name, pct, reset, windowMs, cfg } = v;
+    // Replace the codicon with the spinner (don't prepend) so the stale text
+    // is the same width as normal — otherwise the wider text can overflow the
+    // status bar and VSCodium hides an item.
+    let text = `${spin} ${label}`;
     if (pct != null) {
       const p = Math.round(pct);
       text += ` ${p}% ${bar(p, cfg.segments)}`;
