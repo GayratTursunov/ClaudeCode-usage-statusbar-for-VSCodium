@@ -9,20 +9,28 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 
-let sessionItem, weeklyItem, timer;
+let sessionItem, weeklyItem, pollTimer;
 let hasData = false;     // have we ever rendered real values?
+let backoffAttempt = 0;  // consecutive-failure count for full-jitter backoff
 let backoffUntil = 0;    // skip polling until this timestamp (ms) after a 429
 let activityTimer;       // local poll of Claude Code logs
 let debounceTimer;       // settle timer before an activity-triggered refresh
 let lastLogMtime = 0;    // newest .jsonl mtime seen so far
 let lastApiAttempt = 0;  // when refresh() last hit the network
+let lastValues = null;   // [{ item, icon, label, name, pct, reset, windowMs }] last good render
+let lastGoodAt = 0;      // when lastValues was captured (ms)
+let staleTimer;          // spinner animation interval while showing stale values
+let spinFrame = 0;       // spinner frame index
 
 function getCfg() {
   const c = vscode.workspace.getConfiguration('claudeUsage');
   const home = os.homedir();
   return {
     credentialsPath: (c.get('credentialsPath') || '~/.claude/.credentials.json').replace(/^~(?=$|[/\\])/, home),
-    refreshSeconds: c.get('refreshIntervalSeconds', 300),
+    refreshBaseSeconds: c.get('refreshBaseSeconds', c.get('refreshIntervalSeconds', 90)),
+    refreshJitterPct: c.get('refreshJitterPct', 0.2),
+    backoffBaseSeconds: c.get('backoffBaseSeconds', 2),
+    backoffCapSeconds: c.get('backoffCapSeconds', 300),
     syncToActivity: c.get('syncToActivity', true),
     activityPollSeconds: c.get('activityPollSeconds', 5),
     activityDebounceSeconds: c.get('activityDebounceSeconds', 4),
@@ -119,6 +127,8 @@ function sandGlyph(frac) {
 
 // Short braille "sand drain": leftmost cells stay full, draining toward empty.
 const SAND = ['⠀', '⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿']; // empty → full (9 levels)
+// Braille spinner frames cycled while showing stale (rate-limited) values.
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 function sandBar(frac, cells) {
   const total = cells * (SAND.length - 1);
   let units = Math.round(frac * total);
@@ -184,6 +194,7 @@ function renderItem(item, icon, label, name, pct, reset, cfg, windowMs) {
 }
 
 function showError(kind) {
+  stopStale(); // a real error must not be overwritten by the stale animation
   const msg = {
     'no-token': 'No Claude credentials found (~/.claude/.credentials.json).',
     'auth': 'Login expired — open Claude Code and run /usage to refresh auth.',
@@ -201,34 +212,106 @@ function showError(kind) {
   }
 }
 
+// Re-render both items from the last good values, greyed, with the current
+// spinner frame — signals "stale, refreshing" without losing the numbers.
+function renderStale() {
+  if (!lastValues) return;
+  const spin = SPINNER[spinFrame % SPINNER.length];
+  const since = Math.max(0, Math.round((Date.now() - lastGoodAt) / 1000));
+  const ago = since >= 60 ? `${Math.floor(since / 60)}m ${since % 60}s` : `${since}s`;
+  for (const v of lastValues) {
+    const { item, label, name, pct, reset, windowMs, cfg } = v;
+    // Replace the codicon with the spinner (don't prepend) so the stale text
+    // is the same width as normal — otherwise the wider text can overflow the
+    // status bar and VSCodium hides an item.
+    let text = `${spin} ${label}`;
+    if (pct != null) {
+      const p = Math.round(pct);
+      text += ` ${p}% ${bar(p, cfg.segments)}`;
+      const f = fracLeft(reset, windowMs);
+      if (cfg.showResetGauge && f != null) text += `  ${sandGlyph(f)}${sandBar(f, 3)}`;
+    } else {
+      text += ' —';
+    }
+    item.text = text;
+    item.color = new vscode.ThemeColor('descriptionForeground');
+    item.backgroundColor = undefined;
+    const md = new vscode.MarkdownString(undefined, true);
+    md.appendMarkdown(`**Claude Code — ${name} usage** _(stale)_\n\n`);
+    if (pct != null) md.appendMarkdown(`- Last known: **${Math.round(pct)}%** ${bar(Math.round(pct), cfg.segments)}\n`);
+    md.appendMarkdown(`\n${spin} Rate-limited / offline — backing off. Last updated ${ago} ago. Click to retry.`);
+    item.tooltip = md;
+    item.show();
+  }
+}
+
+// Begin (or keep) the greyed stale animation. No-op if we never had data.
+function startStale() {
+  if (!lastValues || staleTimer) return;
+  renderStale();
+  staleTimer = setInterval(() => {
+    spinFrame = (spinFrame + 1) % SPINNER.length;
+    renderStale();
+  }, 600);
+}
+
+function stopStale() {
+  if (staleTimer) { clearInterval(staleTimer); staleTimer = undefined; }
+}
+
 async function refresh() {
-  if (Date.now() < backoffUntil) return; // still backing off from a 429
+  if (Date.now() < backoffUntil) return; // still inside an active backoff window
   lastApiAttempt = Date.now();
   const cfg = getCfg();
   const r = await fetchUsage(cfg);
   if (r.error) {
-    if (r.error === 'http-429') {
-      backoffUntil = Date.now() + (r.retryAfter || 300) * 1000;
-    }
+    // Full-jitter exponential backoff after ANY failure; 429 Retry-After is a floor.
+    backoffAttempt++;
+    const retryAfter = r.error === 'http-429' ? (r.retryAfter || 0) : 0;
+    const delay = backoffDelayMs(cfg, backoffAttempt, retryAfter);
+    backoffUntil = Date.now() + delay;
+    scheduleNextPoll(delay);
     // Swallow transient errors once we have data — keep the last good values visible.
     const transient = r.error === 'http-429' || r.error === 'network' ||
       r.error === 'timeout' || /^http-5/.test(r.error);
-    if (transient && hasData) return;
+    if (transient && hasData) { startStale(); return; }
     return showError(r.error);
   }
   hasData = true;
+  backoffAttempt = 0;
   backoffUntil = 0;
+  stopStale();
+  scheduleNextPoll(nextPollDelayMs(cfg));
   const s = pick(r.data, 'five_hour', 'session');
   const w = pick(r.data, 'seven_day', 'weekly');
   const sessionMs = cfg.sessionWindowHours * 3600e3;
   const weeklyMs = cfg.weeklyWindowDays * 86400e3;
+  lastValues = [
+    { item: sessionItem, icon: 'pulse', label: 'S', name: 'Session', pct: s.pct, reset: s.reset, windowMs: sessionMs, cfg },
+    { item: weeklyItem, icon: 'calendar', label: 'W', name: 'Weekly', pct: w.pct, reset: w.reset, windowMs: weeklyMs, cfg },
+  ];
+  lastGoodAt = Date.now();
   renderItem(sessionItem, 'pulse', 'S', 'Session', s.pct, s.reset, cfg, sessionMs);
   renderItem(weeklyItem, 'calendar', 'W', 'Weekly', w.pct, w.reset, cfg, weeklyMs);
 }
 
-function startTimer() {
-  if (timer) clearInterval(timer);
-  timer = setInterval(refresh, Math.max(15, getCfg().refreshSeconds) * 1000);
+// Idle poll delay: base ±jitterPct (floored at 15s), so clients de-synchronize.
+function nextPollDelayMs(cfg) {
+  const base = Math.max(15, cfg.refreshBaseSeconds);
+  const j = 1 + (Math.random() * 2 - 1) * cfg.refreshJitterPct; // 1 ± pct
+  return base * j * 1000;
+}
+
+// AWS "full jitter": rand(0, min(cap, base*2^(attempt-1))); 429 floors at retryAfter.
+function backoffDelayMs(cfg, attempt, retryAfterSec) {
+  const ceil = Math.min(cfg.backoffCapSeconds, cfg.backoffBaseSeconds * 2 ** (attempt - 1));
+  const jittered = Math.random() * ceil;
+  return Math.max(retryAfterSec || 0, jittered) * 1000;
+}
+
+function scheduleNextPoll(ms) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(refresh, ms);
 }
 
 // ~/.claude/projects — where Claude Code appends per-request session logs.
@@ -287,19 +370,19 @@ function activate(context) {
     vscode.commands.registerCommand('claudeUsage.refresh', refresh),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claudeUsage')) {
-        startTimer(); startActivityWatch(getCfg()); refresh();
+        startActivityWatch(getCfg()); refresh();
       }
     })
   );
-  refresh();
-  startTimer();
+  refresh(); // self-schedules the next poll based on its outcome
   startActivityWatch(getCfg());
 }
 
 function deactivate() {
-  if (timer) clearInterval(timer);
+  if (pollTimer) clearTimeout(pollTimer);
   if (activityTimer) clearInterval(activityTimer);
   if (debounceTimer) clearTimeout(debounceTimer);
+  if (staleTimer) clearInterval(staleTimer);
 }
 
 module.exports = { activate, deactivate };

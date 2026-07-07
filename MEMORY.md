@@ -35,6 +35,26 @@ Response (relevant fields):
   `message.usage` token counts — but **no** rate-limit fields.
 - There is **no** `claude usage` CLI subcommand; `/usage` is a TUI-only command backed by the endpoint above.
 
+## Transient errors vs. real errors (v0.3.1+)
+
+- `refresh()` distinguishes **transient** failures (`http-429`, `network`, `timeout`, `http-5xx`)
+  from real ones (`no-token`, `auth`, etc.).
+- On a transient failure **while we already have data** (`hasData`), the last good values stay
+  visible and `startStale()` greys them with a slow spinner (600ms, `SPINNER` frames) instead of
+  flashing an error. A real error calls `showError()`, which now first calls `stopStale()` so the
+  stale animation can't overwrite it.
+- **Idle poll (v0.4.1):** self-rescheduling `setTimeout` (not a fixed `setInterval`). Each successful
+  fetch schedules the next poll at `refreshBaseSeconds` (default 90s) ±`refreshJitterPct` (default
+  ±20%) → ~72–108s, floored at 15s. This de-synchronizes clients.
+- **Backoff (v0.4.1):** after **any** failure, full-jitter exponential backoff —
+  `delay = random(0, min(backoffCapSeconds=300, backoffBaseSeconds=2 · 2^(attempt-1)))`. A 429's
+  `Retry-After` is honored as a floor. `backoffUntil` guards manual/activity refreshes during the
+  window; a success resets `backoffAttempt`/`backoffUntil`, calls `stopStale()`, and resumes the
+  jittered base cadence.
+- Every `refresh()` (timer, manual command, or activity-triggered) reschedules the poll, so the idle
+  clock resets after any refresh.
+- Refreshes are also synced to Claude Code request activity (v0.4.0).
+
 ## Environment notes
 
 - This machine has **no standalone `node`**. Use `ELECTRON_RUN_AS_NODE=1 /usr/share/codium/codium`
@@ -44,5 +64,11 @@ Response (relevant fields):
 
 ## Status
 
-- v0.2.0 installed and verified live (Session/Weekly match `/usage`). Pending: user must
-  **Developer: Reload Window** to load the updated build.
+- **v0.4.1** current. Adds jittered idle poll (90s ±20%) and full-jitter exponential backoff after
+  any failure (429 Retry-After as floor). See "Transient errors vs. real errors".
+- **v0.4.0**: live values verified against `/usage`. Resets-in sand-timer gauge, 429 hardening,
+  usage refresh synced to Claude Code request activity, stale-spinner (keeps last good values greyed
+  during transient errors).
+- Repo was restructured (v0.3.x): **the repo root is now the extension folder** — there is no longer
+  a `claude-usage-statusbar/` subfolder.
+- After editing, user must **Developer: Reload Window** in VSCodium to load the updated build.
